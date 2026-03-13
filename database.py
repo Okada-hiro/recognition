@@ -6,11 +6,11 @@ import cv2
 import numpy as np
 
 from recognition.config import AppConfig
-from recognition.face_recognition import DeepFaceEmbedder
+from recognition.face_recognition import InsightFaceAnalyzer
 
 
 class FaceDatabase:
-    def __init__(self, config: AppConfig, embedder: DeepFaceEmbedder) -> None:
+    def __init__(self, config: AppConfig, embedder: InsightFaceAnalyzer) -> None:
         self.config = config
         self.embedder = embedder
         self.embeddings: dict[str, list[tuple[str, np.ndarray]]] = {}
@@ -30,4 +30,3 @@ class FaceDatabase:
                 person_embeddings.append((str(image_path), self.embedder.embed_face(image)))
             if person_embeddings:
                 self.embeddings[person_dir.name] = person_embeddings
-

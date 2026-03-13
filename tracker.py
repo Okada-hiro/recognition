@@ -26,8 +26,8 @@ class TrackState:
     track_id: int
     bbox: BoundingBox
     frames_seen: int = 1
+    initial_area: int = 0
     last_area: int = 0
-    growth_streak: int = 0
     missing_frames: int = 0
     approach_announced: bool = False
 
@@ -48,22 +48,26 @@ class PersonTracker:
         for bbox, confidence in detections:
             track = self._match_existing_track(bbox, assigned)
             if track is None:
-                track = TrackState(track_id=self.next_track_id, bbox=bbox, last_area=bbox.area)
+                track = TrackState(
+                    track_id=self.next_track_id,
+                    bbox=bbox,
+                    initial_area=max(1, bbox.area),
+                    last_area=max(1, bbox.area),
+                )
                 self.tracks[track.track_id] = track
                 self.next_track_id += 1
             else:
                 new_area = max(1, bbox.area)
-                old_area = max(1, track.last_area)
-                if new_area / old_area >= self.approach_area_ratio:
-                    track.growth_streak += 1
-                else:
-                    track.growth_streak = 0
                 track.bbox = bbox
                 track.last_area = new_area
                 track.frames_seen += 1
                 track.missing_frames = 0
 
-            approaching = track.growth_streak >= self.approach_min_frames
+            baseline_area = max(1, track.initial_area)
+            approaching = (
+                track.frames_seen >= self.approach_min_frames
+                and (track.last_area / baseline_area) >= self.approach_area_ratio
+            )
             if approaching and not track.approach_announced:
                 track.approach_announced = True
                 events.append(TrackEvent(track_id=track.track_id, event_type="approached"))

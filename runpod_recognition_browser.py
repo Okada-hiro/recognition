@@ -14,19 +14,24 @@ Useful for browsing outputs such as:
 
 from __future__ import annotations
 
+import asyncio
 import html
+import io
+import json
 import mimetypes
 import os
+import sys
 import threading
+import wave
 from datetime import datetime
 from pathlib import Path
+from urllib import request
 from urllib.parse import quote
-import json
 
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 
 from recognition.config import AppConfig
@@ -39,11 +44,18 @@ LIVE_PERSON_MODEL = os.getenv("RECOGNITION_LIVE_PERSON_MODEL", "yolo11n.pt")
 LIVE_DEVICE = os.getenv("RECOGNITION_LIVE_DEVICE", "auto")
 LIVE_DATABASE_DIR = Path(os.getenv("RECOGNITION_LIVE_DATABASE_DIR", ROOT_DIR.parent / "data_base")).resolve()
 LIVE_JPEG_QUALITY = int(os.getenv("RECOGNITION_LIVE_JPEG_QUALITY", "85"))
+VOICE_TALK_DIR = (ROOT_DIR.parent / "lab_voice_talk").resolve()
+VOICE_TALK_NOTIFY_BASE = os.getenv("RECOGNITION_VOICE_TALK_NOTIFY_BASE", "http://127.0.0.1:8002").rstrip("/")
+VOICE_TALK_HTTP_BASE = os.getenv("RECOGNITION_VOICE_TALK_HTTP_BASE", VOICE_TALK_NOTIFY_BASE).rstrip("/")
+VOICE_TALK_WS_URL = os.getenv("RECOGNITION_VOICE_TALK_WS_URL", "ws://127.0.0.1:8002/ws")
 
 app = FastAPI(title=TITLE, version="1.0.0")
 _live_monitor_lock = threading.Lock()
 _live_monitor: ReceptionMonitor | None = None
 _live_frame_index = 0
+_voice_tts_lock = threading.Lock()
+_voice_tts_module = None
+_voice_tts_error: str | None = None
 
 
 def _resolve_relative_path(relative_path: str) -> Path:
@@ -363,6 +375,7 @@ def _render_live_page() -> str:
         </div>
       </div>
       <canvas id="captureCanvas" hidden></canvas>
+      <audio id="voiceAudio" hidden></audio>
     </div>
   </main>
   <script>
@@ -373,12 +386,14 @@ def _render_live_page() -> str:
     const processedEl = document.getElementById("processed");
     const eventStatusEl = document.getElementById("eventStatus");
     const canvasEl = document.getElementById("captureCanvas");
+    const voiceAudioEl = document.getElementById("voiceAudio");
     const intervalInput = document.getElementById("intervalInput");
     const widthInput = document.getElementById("widthInput");
 
     let mediaStream = null;
     let timerId = null;
     let inFlight = false;
+    let voiceQueue = Promise.resolve();
 
     function setStatus(message) {
       statusEl.textContent = message;
@@ -386,6 +401,45 @@ def _render_live_page() -> str:
 
     function setEventStatus(message) {
       eventStatusEl.textContent = message;
+    }
+
+    async function playTrackEvents(trackEvents) {
+      for (const event of trackEvents) {
+        voiceQueue = voiceQueue.then(() => speakTrackEvent(event)).catch(() => {});
+      }
+      return voiceQueue;
+    }
+
+    async function speakTrackEvent(event) {
+      const params = new URLSearchParams({
+        event_type: event.event_type,
+        track_id: String(event.track_id),
+      });
+      if (event.person_id) {
+        params.set("person_id", event.person_id);
+      }
+      const response = await fetch(`/api/live-utterance?${params.toString()}`);
+      if (!response.ok) {
+        return;
+      }
+      const audioBlob = await response.blob();
+      const objectUrl = URL.createObjectURL(audioBlob);
+      const prevUrl = voiceAudioEl.dataset.url;
+      voiceAudioEl.src = objectUrl;
+      voiceAudioEl.dataset.url = objectUrl;
+      if (prevUrl) {
+        URL.revokeObjectURL(prevUrl);
+      }
+      await voiceAudioEl.play();
+      await new Promise((resolve) => {
+        const onDone = () => {
+          voiceAudioEl.removeEventListener("ended", onDone);
+          voiceAudioEl.removeEventListener("error", onDone);
+          resolve();
+        };
+        voiceAudioEl.addEventListener("ended", onDone);
+        voiceAudioEl.addEventListener("error", onDone);
+      });
     }
 
     async function startCamera() {
@@ -467,6 +521,7 @@ def _render_live_page() -> str:
             eventMessage = trackEvents
               .map((event) => `${event.event_type} track=${event.track_id}${event.person_id ? ` ${event.person_id}` : ""}`)
               .join(" | ");
+            playTrackEvents(trackEvents);
           }
         }
         setStatus(`Processed frame ${frameIndex}.`);
@@ -497,6 +552,91 @@ def _render_live_page() -> str:
 </html>"""
 
 
+def _render_reception_page() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reception Assistant</title>
+  <style>
+    :root {
+      --bg: #f6f2e8;
+      --panel: #fffaf0;
+      --ink: #1c1a18;
+      --line: #d7c8a8;
+    }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      background: linear-gradient(180deg, var(--bg), #efe5d1);
+      color: var(--ink);
+    }
+    main {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(60, 40, 10, 0.08);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 1200px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    iframe {
+      width: 100%;
+      min-height: 920px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: white;
+    }
+    a {
+      color: #0d5c63;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .note {
+      color: #6b665d;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="panel">
+      <h1>Reception Assistant</h1>
+      <p><a href="/">back to browser root</a></p>
+      <p class="note">
+        Single-page receptionist view. Left: camera recognition. Right: microphone conversation UI.
+      </p>
+      <div class="grid">
+        <section>
+          <h2>Vision</h2>
+          <iframe src="/live" allow="camera"></iframe>
+        </section>
+        <section>
+          <h2>Voice</h2>
+          <iframe src="/voice-ui" allow="microphone"></iframe>
+        </section>
+      </div>
+    </div>
+  </main>
+</body>
+</html>"""
+
+
 def _get_live_monitor() -> ReceptionMonitor:
     global _live_monitor
     if _live_monitor is None:
@@ -508,6 +648,85 @@ def _get_live_monitor() -> ReceptionMonitor:
         )
         _live_monitor = ReceptionMonitor(config)
     return _live_monitor
+
+
+def _get_voice_tts_module():
+    global _voice_tts_module, _voice_tts_error
+    if _voice_tts_module is not None:
+        return _voice_tts_module
+    if _voice_tts_error is not None:
+        raise RuntimeError(_voice_tts_error)
+
+    with _voice_tts_lock:
+        if _voice_tts_module is not None:
+            return _voice_tts_module
+        if _voice_tts_error is not None:
+            raise RuntimeError(_voice_tts_error)
+        try:
+            if str(VOICE_TALK_DIR) not in sys.path:
+                sys.path.insert(0, str(VOICE_TALK_DIR))
+            import parallel_faster_text_to_speech as tts_module
+        except Exception as exc:
+            _voice_tts_error = f"voice_tts_import_failed: {exc}"
+            raise RuntimeError(_voice_tts_error) from exc
+        _voice_tts_module = tts_module
+        return _voice_tts_module
+
+
+def _build_utterance_text(event_type: str, person_id: str | None) -> str:
+    if event_type == "approached":
+        if person_id:
+            return f"{person_id}さん、こんにちは。受付です。"
+        return "こんにちは。受付です。"
+    if event_type == "left":
+        if person_id:
+            return f"{person_id}さん、ありがとうございました。"
+        return "ありがとうございました。"
+    return "こんにちは。"
+
+
+def _pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+
+def _proxy_voice_talk(path: str = "/", method: str = "GET", body: bytes | None = None, headers: dict[str, str] | None = None) -> tuple[bytes, str]:
+    endpoint = f"{VOICE_TALK_HTTP_BASE}{path}"
+    req = request.Request(endpoint, data=body, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    with request.urlopen(req, timeout=10) as response:
+        content_type = response.headers.get_content_type()
+        return response.read(), content_type
+
+
+def _rewrite_voice_ui(html_text: str) -> str:
+    html_text = html_text.replace("fetch('/enable-registration'", "fetch('/voice-enable-registration'")
+    html_text = html_text.replace('fetch("/enable-registration"', 'fetch("/voice-enable-registration"')
+    html_text = html_text.replace("window.location.host + '/ws'", "window.location.host + '/voice-ws'")
+    html_text = html_text.replace('window.location.host + "/ws"', 'window.location.host + "/voice-ws"')
+    return html_text
+
+
+def _notify_voice_talk(track_events) -> None:
+    if not VOICE_TALK_NOTIFY_BASE:
+        return
+    for track_event in track_events:
+        if track_event.event_type not in {"approached", "left"}:
+            continue
+        endpoint = f"{VOICE_TALK_NOTIFY_BASE}/recognition/{'approach' if track_event.event_type == 'approached' else 'leave'}"
+        payload = json.dumps({"person_id": track_event.person_id}, ensure_ascii=False).encode("utf-8")
+        req = request.Request(endpoint, data=payload, headers={"content-type": "application/json"}, method="POST")
+        try:
+            with request.urlopen(req, timeout=1.5):
+                pass
+        except Exception:
+            continue
 
 
 @app.get("/health")
@@ -523,6 +742,30 @@ async def root() -> HTMLResponse:
 @app.get("/live", response_class=HTMLResponse)
 async def live_page() -> HTMLResponse:
     return HTMLResponse(_render_live_page())
+
+
+@app.get("/reception", response_class=HTMLResponse)
+async def reception_page() -> HTMLResponse:
+    return HTMLResponse(_render_reception_page())
+
+
+@app.get("/voice-ui", response_class=HTMLResponse)
+async def voice_ui() -> HTMLResponse:
+    try:
+        body, _content_type = await asyncio.to_thread(_proxy_voice_talk, "/")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"voice_ui_proxy_failed: {exc}") from exc
+    html_text = body.decode("utf-8", errors="replace")
+    return HTMLResponse(_rewrite_voice_ui(html_text))
+
+
+@app.post("/voice-enable-registration")
+async def voice_enable_registration() -> Response:
+    try:
+        body, content_type = await asyncio.to_thread(_proxy_voice_talk, "/enable-registration", "POST")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"voice_registration_proxy_failed: {exc}") from exc
+    return Response(content=body, media_type=content_type)
 
 
 @app.get("/browse/{relative_path:path}", response_class=HTMLResponse)
@@ -562,6 +805,9 @@ async def live_frame(frame: UploadFile = File(...), save_snapshot: str = Form(de
         if save_snapshot.lower() == "true":
             monitor.storage.save_snapshot(frame_index, annotated)
 
+    if event.track_events:
+        await asyncio.to_thread(_notify_voice_talk, event.track_events)
+
     ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_JPEG_QUALITY])
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode annotated frame.")
@@ -580,6 +826,69 @@ async def live_frame(frame: UploadFile = File(...), save_snapshot: str = Form(de
         ),
     }
     return Response(content=encoded.tobytes(), media_type="image/jpeg", headers=headers)
+
+
+@app.get("/api/live-utterance")
+async def live_utterance(event_type: str, track_id: int, person_id: str | None = None) -> Response:
+    del track_id
+    try:
+        tts_module = _get_voice_tts_module()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    text = _build_utterance_text(event_type, person_id)
+    try:
+        pcm_bytes = await asyncio.to_thread(tts_module.synthesize_speech_to_memory, text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"voice_tts_failed: {exc}") from exc
+    if not pcm_bytes:
+        raise HTTPException(status_code=500, detail="voice_tts_empty")
+
+    wav_bytes = _pcm16_to_wav_bytes(pcm_bytes)
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.websocket("/voice-ws")
+async def voice_ws_proxy(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        import websockets
+    except Exception:
+        await websocket.close(code=1011)
+        return
+
+    try:
+        async with websockets.connect(VOICE_TALK_WS_URL, max_size=None) as upstream:
+            async def client_to_upstream() -> None:
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            async def upstream_to_client() -> None:
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            client_task = asyncio.create_task(client_to_upstream())
+            upstream_task = asyncio.create_task(upstream_to_client())
+            done, pending = await asyncio.wait({client_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        await websocket.close(code=1011)
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)

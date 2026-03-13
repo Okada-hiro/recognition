@@ -5,9 +5,9 @@ import numpy as np
 
 from recognition.config import AppConfig
 from recognition.database import FaceDatabase
-from recognition.detectors import RetinaFaceDetector, YoloPersonDetector
-from recognition.face_recognition import DeepFaceEmbedder, FaceMatcher
-from recognition.models import BoundingBox, EventRecord, FaceDetection, FaceMatch, TrackEvent
+from recognition.detectors import YoloPersonDetector
+from recognition.face_recognition import FaceMatcher, InsightFaceAnalyzer
+from recognition.models import EventRecord, FaceDetection, FaceMatch, TrackEvent
 from recognition.storage import EventStorage
 from recognition.tracker import PersonTracker, iou
 
@@ -16,8 +16,8 @@ class ReceptionMonitor:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.person_detector = YoloPersonDetector(config.person_model, config.person_confidence, config.device)
-        self.face_detector = RetinaFaceDetector(config.face_confidence)
-        self.embedder = DeepFaceEmbedder(config.face_model_name)
+        self.face_analyzer = InsightFaceAnalyzer(config)
+        self.embedder = self.face_analyzer
         self.database = FaceDatabase(config, self.embedder)
         self.database.build()
         self.matcher = FaceMatcher(config.face_match_threshold)
@@ -32,16 +32,14 @@ class ReceptionMonitor:
     def process_frame(self, frame: np.ndarray, frame_index: int) -> tuple[np.ndarray, EventRecord]:
         person_candidates = self.person_detector.detect(frame)
         persons, track_events = self.tracker.update(person_candidates)
-        faces = self._attach_faces_to_persons(frame, persons)
+        face_items = self._attach_faces_to_persons(frame, persons)
+        faces = [face for face, _embedding in face_items]
         matches: list[FaceMatch] = []
         notes: list[str] = []
 
-        for face in faces:
-            crop = self._crop(frame, face.bbox)
-            if crop is None:
-                continue
+        for face, embedding in face_items:
             try:
-                embedding = self.embedder.embed_face(crop)
+                embedding = np.asarray(embedding, dtype=np.float32)
             except Exception as exc:
                 notes.append(f"face_embedding_failed: {exc}")
                 continue
@@ -94,9 +92,9 @@ class ReceptionMonitor:
                 self.track_identities.pop(track_event.track_id, None)
         return resolved_events
 
-    def _attach_faces_to_persons(self, frame: np.ndarray, persons: list) -> list[FaceDetection]:
-        faces = self.face_detector.detect(frame)
-        for face in faces:
+    def _attach_faces_to_persons(self, frame: np.ndarray, persons: list) -> list[tuple[FaceDetection, np.ndarray]]:
+        face_items = self.face_analyzer.detect_faces(frame)
+        for face, _embedding in face_items:
             best_track_id: int | None = None
             best_iou = 0.0
             for person in persons:
@@ -105,14 +103,7 @@ class ReceptionMonitor:
                     best_iou = overlap
                     best_track_id = person.track_id
             face.person_track_id = best_track_id
-        return faces
-
-    @staticmethod
-    def _crop(frame: np.ndarray, bbox: BoundingBox) -> np.ndarray | None:
-        crop = frame[max(0, bbox.y1) : max(0, bbox.y2), max(0, bbox.x1) : max(0, bbox.x2)]
-        if crop.size == 0:
-            return None
-        return crop
+        return face_items
 
     @staticmethod
     def _annotate(
