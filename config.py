@@ -1,0 +1,26 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(slots=True)
+class AppConfig:
+    database_dir: Path = PROJECT_ROOT / "data_base"
+    logs_dir: Path = PROJECT_ROOT / "recognition" / "logs"
+    snapshots_dir: Path = PROJECT_ROOT / "recognition" / "snapshots"
+    person_model: str = "yolo11n.pt"
+    device: str = "auto"
+    face_model_name: str = "ArcFace"
+    face_detector_backend: str = "retinaface"
+    camera_index: int = 0
+    person_confidence: float = 0.45
+    face_confidence: float = 0.90
+    face_match_threshold: float = 0.35
+    approach_area_ratio: float = 1.15
+    approach_min_frames: int = 3
+    save_snapshots: bool = True
+    image_extensions: tuple[str, ...] = field(default_factory=lambda: (".jpg", ".jpeg", ".png"))
