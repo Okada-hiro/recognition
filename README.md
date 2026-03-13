@@ -90,6 +90,12 @@ CPU のみで環境を作りたい場合:
 FORCE_CPU=1 bash environment.sh
 ```
 
+Colab などで `venv` 作成が失敗する場合:
+
+```bash
+SKIP_VENV=1 bash environment.sh
+```
+
 仮想環境を有効化する場合:
 
 ```bash
