@@ -17,20 +17,33 @@ from __future__ import annotations
 import html
 import mimetypes
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
+import json
 
+import cv2
+import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 
+from recognition.config import AppConfig
+from recognition.pipeline import ReceptionMonitor
 
 ROOT_DIR = Path(os.getenv("RECOGNITION_BROWSE_ROOT", Path(__file__).resolve().parent)).resolve()
 PORT = int(os.getenv("PORT", "8000"))
 TITLE = "Recognition Browser"
+LIVE_PERSON_MODEL = os.getenv("RECOGNITION_LIVE_PERSON_MODEL", "yolo11n.pt")
+LIVE_DEVICE = os.getenv("RECOGNITION_LIVE_DEVICE", "auto")
+LIVE_DATABASE_DIR = Path(os.getenv("RECOGNITION_LIVE_DATABASE_DIR", ROOT_DIR.parent / "data_base")).resolve()
+LIVE_JPEG_QUALITY = int(os.getenv("RECOGNITION_LIVE_JPEG_QUALITY", "85"))
 
 app = FastAPI(title=TITLE, version="1.0.0")
+_live_monitor_lock = threading.Lock()
+_live_monitor: ReceptionMonitor | None = None
+_live_frame_index = 0
 
 
 def _resolve_relative_path(relative_path: str) -> Path:
@@ -166,6 +179,7 @@ def _render_directory_page(current: Path) -> str:
       <h1>{TITLE}</h1>
       <p>Root: <code>{html.escape(str(ROOT_DIR))}</code></p>
       <p>Current: <code>{html.escape(rel)}</code></p>
+      <p><a href="/live">open live recognition</a></p>
       {parent_link}
       <table>
         <thead>
@@ -238,6 +252,264 @@ def _render_file_page(target: Path) -> str:
 </html>"""
 
 
+def _render_live_page() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Recognition</title>
+  <style>
+    :root {
+      --bg: #f6f2e8;
+      --panel: #fffaf0;
+      --ink: #1c1a18;
+      --line: #d7c8a8;
+      --link: #0d5c63;
+      --accent: #9c6644;
+    }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      background: linear-gradient(180deg, var(--bg), #efe5d1);
+      color: var(--ink);
+    }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(60, 40, 10, 0.08);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+      align-items: start;
+    }
+    video, img, canvas {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #000;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 16px 0;
+    }
+    button, input {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: var(--accent);
+      color: white;
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .status {
+      color: #6b665d;
+      min-height: 1.5em;
+    }
+    .note {
+      font-size: 0.95rem;
+      color: #6b665d;
+    }
+    code {
+      font-family: "SFMono-Regular", Menlo, monospace;
+      background: #f5ecd8;
+      border-radius: 8px;
+      padding: 2px 6px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="panel">
+      <h1>Live Recognition</h1>
+      <p><a href="/">back to browser root</a></p>
+      <p class="note">
+        Safari will access the Mac camera locally, then send snapshots to RunPod for person detection, face detection,
+        and face recognition. This is a simple first step, so frames are sampled at a fixed interval.
+      </p>
+      <div class="controls">
+        <button id="startBtn">Start Camera</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <label>Interval (ms) <input id="intervalInput" type="number" min="300" step="100" value="1000"></label>
+        <label>Width <input id="widthInput" type="number" min="320" step="80" value="960"></label>
+      </div>
+      <div class="status" id="status">Idle.</div>
+      <div class="note" id="eventStatus">No approach/leave events yet.</div>
+      <div class="row">
+        <div>
+          <h2>Camera</h2>
+          <video id="camera" autoplay playsinline muted></video>
+        </div>
+        <div>
+          <h2>Processed</h2>
+          <img id="processed" alt="processed frame">
+        </div>
+      </div>
+      <canvas id="captureCanvas" hidden></canvas>
+    </div>
+  </main>
+  <script>
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusEl = document.getElementById("status");
+    const cameraEl = document.getElementById("camera");
+    const processedEl = document.getElementById("processed");
+    const eventStatusEl = document.getElementById("eventStatus");
+    const canvasEl = document.getElementById("captureCanvas");
+    const intervalInput = document.getElementById("intervalInput");
+    const widthInput = document.getElementById("widthInput");
+
+    let mediaStream = null;
+    let timerId = null;
+    let inFlight = false;
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function setEventStatus(message) {
+      eventStatusEl.textContent = message;
+    }
+
+    async function startCamera() {
+      if (mediaStream) {
+        return;
+      }
+      const width = Number(widthInput.value) || 960;
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: width } },
+        audio: false,
+      });
+      cameraEl.srcObject = mediaStream;
+      await cameraEl.play();
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus("Camera started. Sending frames to RunPod...");
+      scheduleLoop();
+    }
+
+    function stopCamera() {
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+        mediaStream = null;
+      }
+      cameraEl.srcObject = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus("Stopped.");
+    }
+
+    function scheduleLoop() {
+      if (timerId) {
+        clearInterval(timerId);
+      }
+      const intervalMs = Math.max(300, Number(intervalInput.value) || 1000);
+      timerId = setInterval(sendFrame, intervalMs);
+      sendFrame();
+    }
+
+    async function sendFrame() {
+      if (!mediaStream || inFlight || cameraEl.videoWidth === 0 || cameraEl.videoHeight === 0) {
+        return;
+      }
+      inFlight = true;
+      try {
+        canvasEl.width = cameraEl.videoWidth;
+        canvasEl.height = cameraEl.videoHeight;
+        const ctx = canvasEl.getContext("2d");
+        ctx.drawImage(cameraEl, 0, 0, canvasEl.width, canvasEl.height);
+        const blob = await new Promise((resolve) => canvasEl.toBlob(resolve, "image/jpeg", 0.85));
+        const formData = new FormData();
+        formData.append("frame", blob, "frame.jpg");
+        const response = await fetch("/api/live-frame", {
+          method: "POST",
+          body: formData,
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `HTTP ${response.status}`);
+        }
+        const imageBlob = await response.blob();
+        const objectUrl = URL.createObjectURL(imageBlob);
+        const prevUrl = processedEl.dataset.url;
+        processedEl.src = objectUrl;
+        processedEl.dataset.url = objectUrl;
+        if (prevUrl) {
+          URL.revokeObjectURL(prevUrl);
+        }
+        const frameIndex = response.headers.get("x-frame-index");
+        const trackEventsRaw = response.headers.get("x-track-events");
+        let eventMessage = "No approach/leave events.";
+        if (trackEventsRaw) {
+          const trackEvents = JSON.parse(trackEventsRaw);
+          if (trackEvents.length > 0) {
+            eventMessage = trackEvents
+              .map((event) => `${event.event_type} track=${event.track_id}${event.person_id ? ` ${event.person_id}` : ""}`)
+              .join(" | ");
+          }
+        }
+        setStatus(`Processed frame ${frameIndex}.`);
+        setEventStatus(eventMessage);
+      } catch (error) {
+        setStatus(`Error: ${error.message}`);
+        setEventStatus("Approach/leave events unavailable.");
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        await startCamera();
+      } catch (error) {
+        setStatus(`Camera start failed: ${error.message}`);
+      }
+    });
+    stopBtn.addEventListener("click", stopCamera);
+    intervalInput.addEventListener("change", () => {
+      if (mediaStream) {
+        scheduleLoop();
+      }
+    });
+  </script>
+</body>
+</html>"""
+
+
+def _get_live_monitor() -> ReceptionMonitor:
+    global _live_monitor
+    if _live_monitor is None:
+        config = AppConfig(
+            person_model=LIVE_PERSON_MODEL,
+            device=LIVE_DEVICE,
+            database_dir=LIVE_DATABASE_DIR,
+            save_snapshots=False,
+        )
+        _live_monitor = ReceptionMonitor(config)
+    return _live_monitor
+
+
 @app.get("/health")
 async def health() -> dict[str, object]:
     return {"ok": True, "root": str(ROOT_DIR), "port": PORT}
@@ -246,6 +518,11 @@ async def health() -> dict[str, object]:
 @app.get("/", response_class=HTMLResponse)
 async def root() -> HTMLResponse:
     return HTMLResponse(_render_directory_page(ROOT_DIR))
+
+
+@app.get("/live", response_class=HTMLResponse)
+async def live_page() -> HTMLResponse:
+    return HTMLResponse(_render_live_page())
 
 
 @app.get("/browse/{relative_path:path}", response_class=HTMLResponse)
@@ -265,6 +542,44 @@ async def serve_file(relative_path: str):
         raise HTTPException(status_code=404, detail="File not found.")
     media_type, _ = mimetypes.guess_type(target.name)
     return FileResponse(target, media_type=media_type or "application/octet-stream", filename=target.name)
+
+
+@app.post("/api/live-frame")
+async def live_frame(frame: UploadFile = File(...), save_snapshot: str = Form(default="false")) -> Response:
+    global _live_frame_index
+
+    data = await frame.read()
+    np_buffer = np.frombuffer(data, dtype=np.uint8)
+    image = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Could not decode uploaded frame.")
+
+    with _live_monitor_lock:
+        monitor = _get_live_monitor()
+        frame_index = _live_frame_index
+        _live_frame_index += 1
+        annotated, event = monitor.process_frame(image, frame_index)
+        if save_snapshot.lower() == "true":
+            monitor.storage.save_snapshot(frame_index, annotated)
+
+    ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_JPEG_QUALITY])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode annotated frame.")
+
+    headers = {
+        "x-frame-index": str(frame_index),
+        "x-match-count": str(len(event.matches)),
+        "x-face-count": str(len(event.faces)),
+        "x-person-count": str(len(event.persons)),
+        "x-track-events": json.dumps(
+            [
+                {"track_id": item.track_id, "event_type": item.event_type, "person_id": item.person_id}
+                for item in event.track_events
+            ],
+            ensure_ascii=False,
+        ),
+    }
+    return Response(content=encoded.tobytes(), media_type="image/jpeg", headers=headers)
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)

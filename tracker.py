@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from recognition.models import BoundingBox, PersonDetection
+from recognition.models import BoundingBox, PersonDetection, TrackEvent
 
 
 def _intersection(a: BoundingBox, b: BoundingBox) -> int:
@@ -28,18 +28,22 @@ class TrackState:
     frames_seen: int = 1
     last_area: int = 0
     growth_streak: int = 0
+    missing_frames: int = 0
+    approach_announced: bool = False
 
 
 @dataclass(slots=True)
 class PersonTracker:
     approach_area_ratio: float
     approach_min_frames: int
+    max_missing_frames: int
     next_track_id: int = 1
     tracks: dict[int, TrackState] = field(default_factory=dict)
 
-    def update(self, detections: list[tuple[BoundingBox, float]]) -> list[PersonDetection]:
+    def update(self, detections: list[tuple[BoundingBox, float]]) -> tuple[list[PersonDetection], list[TrackEvent]]:
         assigned: set[int] = set()
         results: list[PersonDetection] = []
+        events: list[TrackEvent] = []
 
         for bbox, confidence in detections:
             track = self._match_existing_track(bbox, assigned)
@@ -57,6 +61,12 @@ class PersonTracker:
                 track.bbox = bbox
                 track.last_area = new_area
                 track.frames_seen += 1
+                track.missing_frames = 0
+
+            approaching = track.growth_streak >= self.approach_min_frames
+            if approaching and not track.approach_announced:
+                track.approach_announced = True
+                events.append(TrackEvent(track_id=track.track_id, event_type="approached"))
 
             assigned.add(track.track_id)
             results.append(
@@ -64,12 +74,24 @@ class PersonTracker:
                     track_id=track.track_id,
                     confidence=confidence,
                     bbox=bbox,
-                    approaching=track.growth_streak >= self.approach_min_frames,
+                    approaching=approaching,
                 )
             )
 
-        self.tracks = {track_id: track for track_id, track in self.tracks.items() if track_id in assigned}
-        return results
+        stale_track_ids: list[int] = []
+        for track_id, track in self.tracks.items():
+            if track_id in assigned:
+                continue
+            track.missing_frames += 1
+            if track.missing_frames > self.max_missing_frames:
+                if track.approach_announced:
+                    events.append(TrackEvent(track_id=track.track_id, event_type="left"))
+                stale_track_ids.append(track_id)
+
+        for track_id in stale_track_ids:
+            del self.tracks[track_id]
+
+        return results, events
 
     def _match_existing_track(self, bbox: BoundingBox, assigned: set[int]) -> TrackState | None:
         best_track: TrackState | None = None
@@ -82,4 +104,3 @@ class PersonTracker:
                 best_iou = score
                 best_track = track
         return best_track if best_iou >= 0.2 else None
-

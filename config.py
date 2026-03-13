@@ -22,5 +22,6 @@ class AppConfig:
     face_match_threshold: float = 0.35
     approach_area_ratio: float = 1.15
     approach_min_frames: int = 3
+    track_max_missing_frames: int = 6
     save_snapshots: bool = True
     image_extensions: tuple[str, ...] = field(default_factory=lambda: (".jpg", ".jpeg", ".png"))

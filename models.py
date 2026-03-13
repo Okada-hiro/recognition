@@ -53,12 +53,20 @@ class FaceMatch:
 
 
 @dataclass(slots=True)
+class TrackEvent:
+    track_id: int
+    event_type: str
+    person_id: str | None = None
+
+
+@dataclass(slots=True)
 class EventRecord:
     timestamp: str
     frame_index: int
     persons: list[PersonDetection]
     faces: list[FaceDetection]
     matches: list[FaceMatch]
+    track_events: list[TrackEvent] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @classmethod
@@ -68,6 +76,7 @@ class EventRecord:
         persons: list[PersonDetection],
         faces: list[FaceDetection],
         matches: list[FaceMatch],
+        track_events: list[TrackEvent] | None = None,
         notes: list[str] | None = None,
     ) -> "EventRecord":
         return cls(
@@ -76,5 +85,6 @@ class EventRecord:
             persons=persons,
             faces=faces,
             matches=matches,
+            track_events=track_events or [],
             notes=notes or [],
         )
